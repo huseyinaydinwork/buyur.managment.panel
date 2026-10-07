@@ -1,0 +1,376 @@
+// BUYUR Growth & Sales Panel — data model
+//
+// Enumerations are stored as strings (SQLite) and validated in the app layer
+// (see src/lib/constants.ts + Zod schemas). Derived metrics (CPL, ROAS,
+// conversion rates, weighted pipeline...) are NOT stored; they are computed
+// from raw rows in src/lib/metrics.ts.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  name         String
+  passwordHash String
+  role         String    @default("SALES") // ADMIN | MARKETING | SALES | PROJECT
+  // Per-user overrides on top of role defaults: JSON { "<module>": true|false }
+  permissions  String    @default("{}")
+  isActive     Boolean   @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  sessions           Session[]
+  ownedLeads         Lead[]         @relation("LeadOwner")
+  activities         Activity[]
+  ownedTasks         Task[]         @relation("TaskOwner")
+  createdTasks       Task[]         @relation("TaskCreator")
+  followUps          FollowUp[]     @relation("FollowUpOwner")
+  completedFollowUps FollowUp[]     @relation("FollowUpCompleter")
+  campaigns          Campaign[]
+  contents           Content[]
+  notifications      Notification[]
+  ownedProjects      Project[]
+
+  @@index([role])
+  @@index([isActive])
+}
+
+model Session {
+  id         String   @id // sha256(token) — the raw token only lives in the cookie
+  userId     String
+  expiresAt  DateTime
+  userAgent  String?
+  createdAt  DateTime @default(now())
+  lastSeenAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model LeadSource {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  isActive  Boolean  @default(true)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  leads Lead[]
+}
+
+model Business {
+  id          String    @id @default(cuid())
+  name        String
+  type        String? // RESTAURANT | CAFE | ...
+  city        String?
+  district    String?
+  address     String?
+  instagram   String?
+  website     String?
+  branchCount Int       @default(1)
+  status      String    @default("PROSPECT") // PROSPECT | CUSTOMER | CHURNED
+  notes       String?
+  searchKey   String    @default("")
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  contacts   Contact[]
+  leads      Lead[]
+  activities Activity[]
+  tasks      Task[]
+
+  @@index([status])
+  @@index([city])
+  @@index([createdAt])
+  @@index([deletedAt])
+}
+
+model Contact {
+  id          String   @id @default(cuid())
+  businessId  String
+  name        String
+  role        String?
+  phone       String?
+  phoneDigits String?
+  email       String?
+  isPrimary   Boolean  @default(false)
+  searchKey   String   @default("")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  leads    Lead[]
+
+  @@index([businessId])
+  @@index([phoneDigits])
+}
+
+// A Lead is a sales opportunity for one Business (a business can have several
+// over time). It carries the deal value; "won" leads are revenue.
+model Lead {
+  id               String    @id @default(cuid())
+  businessId       String
+  contactId        String?
+  ownerId          String?
+  sourceId         String?
+  campaignId       String?
+  status           String    @default("NEW")
+  value            Int       @default(0) // TRY
+  score            Int       @default(0)
+  scoreComputedAt  DateTime?
+  proposalInterest Boolean   @default(false)
+  notes            String?
+  lostReason       String?
+  demoDate         DateTime?
+
+  // Stage milestones — first time the lead reached each stage. Used for
+  // funnel / conversion analytics (cohort based) without a separate history table.
+  contactedAt      DateTime?
+  qualifiedAt      DateTime?
+  demoScheduledAt  DateTime?
+  demoCompletedAt  DateTime?
+  trialAt          DateTime?
+  negotiationAt    DateTime?
+  wonAt            DateTime?
+  lostAt           DateTime?
+  stageChangedAt   DateTime  @default(now())
+
+  // Denormalised for fast sorting/filtering in the leads table. Kept in sync
+  // by src/lib/lead-sync.ts — never edited directly.
+  lastActivityAt   DateTime?
+  nextFollowUpAt   DateTime?
+  nextFollowUpNote String?
+  searchKey        String    @default("")
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  business   Business    @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  contact    Contact?    @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  owner      User?       @relation("LeadOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  source     LeadSource? @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+  campaign   Campaign?   @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  activities Activity[]
+  followUps  FollowUp[]
+  tasks      Task[]
+
+  @@index([status])
+  @@index([ownerId])
+  @@index([businessId])
+  @@index([createdAt])
+  @@index([nextFollowUpAt])
+  @@index([sourceId])
+  @@index([campaignId])
+  @@index([wonAt])
+  @@index([score])
+  @@index([deletedAt])
+}
+
+// Central activity log: powers dashboard feeds, lead/business timelines and audit.
+model Activity {
+  id         String   @id @default(cuid())
+  type       String // NOTE | CALL | WHATSAPP | EMAIL | MEETING | DEMO | FOLLOW_UP | STATUS_CHANGE | LEAD_CREATED | ...
+  userId     String?
+  entityType String // LEAD | BUSINESS | TASK | CAMPAIGN | CONTENT | USER
+  entityId   String
+  leadId     String?
+  businessId String?
+  campaignId String?
+  body       String?
+  metadata   String   @default("{}") // JSON
+  createdAt  DateTime @default(now())
+
+  user     User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  lead     Lead?     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  business Business? @relation(fields: [businessId], references: [id], onDelete: SetNull)
+  campaign Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@index([leadId, createdAt])
+  @@index([businessId, createdAt])
+  @@index([entityType, entityId])
+  @@index([userId])
+  @@index([type])
+}
+
+model FollowUp {
+  id            String    @id @default(cuid())
+  leadId        String
+  ownerId       String
+  dueAt         DateTime
+  note          String?
+  completedAt   DateTime?
+  completedById String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  lead        Lead  @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  owner       User  @relation("FollowUpOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  completedBy User? @relation("FollowUpCompleter", fields: [completedById], references: [id], onDelete: SetNull)
+
+  @@index([dueAt])
+  @@index([ownerId, completedAt, dueAt])
+  @@index([leadId])
+}
+
+model Task {
+  id          String    @id @default(cuid())
+  title       String
+  description String?
+  ownerId     String?
+  createdById String?
+  leadId      String?
+  businessId  String?
+  projectId   String?
+  dueAt       DateTime?
+  priority    String    @default("MEDIUM") // LOW | MEDIUM | HIGH
+  status      String    @default("TODO") // TODO | IN_PROGRESS | DONE
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  owner     User?     @relation("TaskOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  createdBy User?     @relation("TaskCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  lead      Lead?     @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  business  Business? @relation(fields: [businessId], references: [id], onDelete: SetNull)
+  project   Project?  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([ownerId])
+  @@index([projectId])
+  @@index([status])
+  @@index([dueAt])
+  @@index([leadId])
+  @@index([businessId])
+}
+
+model Campaign {
+  id          String    @id @default(cuid())
+  name        String
+  description String?
+  channel     String // INSTAGRAM | META_ADS | ...
+  startDate   DateTime?
+  endDate     DateTime?
+  budget      Int       @default(0) // TRY, planned
+  spend       Int       @default(0) // TRY, actual (raw input)
+  ownerId     String?
+  status      String    @default("DRAFT") // DRAFT | ACTIVE | PAUSED | COMPLETED
+  searchKey   String    @default("")
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  owner      User?      @relation(fields: [ownerId], references: [id], onDelete: SetNull)
+  leads      Lead[]
+  contents   Content[]
+  activities Activity[]
+
+  @@index([status])
+  @@index([ownerId])
+  @@index([createdAt])
+  @@index([deletedAt])
+}
+
+model Content {
+  id             String    @id @default(cuid())
+  title          String
+  platform       String // INSTAGRAM | TIKTOK | LINKEDIN | X | YOUTUBE | OTHER
+  format         String // REEL | CAROUSEL | SINGLE | STORY | VIDEO | POST
+  campaignId     String?
+  ownerId        String?
+  status         String    @default("IDEA")
+  publishAt      DateTime?
+  url            String?
+  views          Int       @default(0)
+  likes          Int       @default(0)
+  saves          Int       @default(0)
+  shares         Int       @default(0)
+  leadsGenerated Int       @default(0)
+  notes          String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  campaign Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  owner    User?     @relation(fields: [ownerId], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([campaignId])
+  @@index([publishAt])
+  @@index([ownerId])
+}
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  title     String
+  body      String?
+  href      String?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@index([createdAt])
+}
+
+// Key/value settings (pipeline stage probabilities, system boot info...)
+model AppSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+// Project management mode: internal projects for the marketing / sales teams.
+// Progress is derived from task completion — never stored.
+model Project {
+  id          String    @id @default(cuid())
+  name        String
+  description String?
+  team        String    @default("GENERAL") // GENERAL | MARKETING | SALES — controls who can see it
+  status      String    @default("PLANNING") // PLANNING | ACTIVE | ON_HOLD | DONE
+  priority    String    @default("MEDIUM") // LOW | MEDIUM | HIGH
+  ownerId     String?
+  startDate   DateTime?
+  dueDate     DateTime?
+  searchKey   String    @default("")
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  owner User?  @relation(fields: [ownerId], references: [id], onDelete: SetNull)
+  tasks Task[]
+
+  @@index([team])
+  @@index([status])
+  @@index([ownerId])
+  @@index([dueDate])
+  @@index([deletedAt])
+}
+
+// Sales playbook: call scripts, WhatsApp templates, objection handling, strategies.
+// Bodies may contain placeholders ({isletme}, {yetkili}, {satisci}, {semt}, {sehir}).
+model PlaybookEntry {
+  id        String   @id @default(cuid())
+  category  String // CALL | WHATSAPP | OBJECTION | STRATEGY
+  stage     String? // optional lead status this entry is most useful for
+  title     String
+  body      String
+  sortOrder Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([category, sortOrder])
+}
